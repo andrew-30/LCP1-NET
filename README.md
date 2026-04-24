@@ -9,8 +9,6 @@
 ![License](https://img.shields.io/badge/License-MIT-0F6E56?style=flat-square)
 ![Status](https://img.shields.io/badge/Status-Active%20Research-orange?style=flat-square)
 
-**Masters Thesis Project · University of Padova × Dublin City University**
-
 *An unsupervised machine learning pipeline that detects gene co-expression network breakdown in colorectal cancer — with a specific focus on the oncogenic role of L-Plastin (LCP1)*
 
 [Overview](#overview) · [Architecture](#architecture) · [Installation](#installation) · [Data](#data) · [Usage](#usage) · [Results](#results) · [Citation](#citation)
@@ -433,7 +431,7 @@ read_info  <- subset(tcga_projects, project == "LUAD") # Lung adenocarcinoma
 @mastersthesis{lcp1net2025,
   title  = {Network-Level Characterisation of L-Plastin (LCP1)
             Co-expression Dysregulation in Colorectal Cancer},
-  author = {[YOUR NAME]},
+  author = {[ANDREW KISITU]},
   school = {University of Padova / Dublin City University},
   year   = {2025},
   note   = {Quantitative and Computational Biosciences}
@@ -473,9 +471,6 @@ Data from GTEx and TCGA is used in accordance with their respective data use agr
 ---
 
 <div align="center">
-
-**Masters Thesis · Quantitative and Computational Biosciences**
-**University of Padova × Dublin City University · 2025**
 
 *Built to advance our understanding of L-Plastin's network-level role in colorectal cancer*
 
