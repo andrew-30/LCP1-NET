@@ -1,0 +1,279 @@
+---
+title: "COLORECTAL WCGNA"
+format: html
+editor: visual
+---
+
+**Unified colorectal normal reference from GTEx + TCGA \# All data sourced through recount3 for uniform processing**
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# complete_pipeline.R
+# ══════════════════════════════════════════════════════════════════════
+# Strategy 1: Unified colorectal normal reference from GTEx + TCGA
+# All data sourced through recount3 for uniform processing
+#
+# Data acquired:
+#   Normal reference:
+#     GTEx Colon - Sigmoid        (~320 samples)
+#     GTEx Colon - Transverse     (~280 samples)
+#     TCGA-COAD matched normals   (~40  samples)
+#     TCGA-READ matched normals   (~10  samples)
+#   Tumour validation:
+#     TCGA-COAD primary tumours   (~460 samples)
+#     TCGA-READ primary tumours   (~166 samples)
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Install packages (run once) ───────────────────────────────────────
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+pkgs <- c("recount3", "DESeq2", "sva", "WGCNA", "flashClust",
+          "edgeR", "limma", "gridExtra", "biomaRt",
+          "SummarizedExperiment", "BiocParallel")
+
+for (pkg in pkgs) {
+    if (!requireNamespace(pkg, quietly = TRUE))
+        BiocManager::install(pkg)
+}
+
+# Create output directories
+dir.create("data/raw",       recursive = TRUE, showWarnings = FALSE)
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+dir.create("data/wgcna",     recursive = TRUE, showWarnings = FALSE)
+dir.create("plots",          showWarnings = FALSE)
+
+cat("Environment ready\n")
+cat("=" , rep("=", 59), "\n", sep="")
+```
+
+```{r}
+# ── Load libraries ────────────────────────────────────────────────────
+library(ggplot2)
+suppressPackageStartupMessages({
+    library(recount3)
+    library(DESeq2)
+    library(sva)
+    library(WGCNA)
+    library(flashClust)
+    library(SummarizedExperiment)
+    library(gridExtra)
+})
+
+
+# Allow parallel processing for WGCNA
+allowWGCNAThreads()
+```
+
+BLOCK 1 — DATA ACQUISITION via recount3 (URL-fixed version)
+
+```{r}
+cat("\nBLOCK 1: Data Acquisition\n")
+cat("-", rep("-", 40), "\n", sep="")
+
+# ── Set recount3 URL — try AWS S3 first, fall back to alternatives ────
+# This bypasses the duffel load balancer which causes the homes_index error
+
+set_recount3_url <- function() {
+    urls <- c(
+        "https://recount-opendata.s3.amazonaws.com/recount3/release",
+        "https://sciserver.org/public-data/recount3/data",
+        "http://duffel.rail.bio/recount3"
+    )
+    for (url in urls) {
+        cat("Trying recount3 URL:", url, "... ")
+        tryCatch({
+            options(recount3_url = url)
+            test <- available_projects()
+            cat("OK ✓\n")
+            cat("Using:", url, "\n")
+            return(TRUE)
+        }, error = function(e) {
+            cat("FAILED\n")
+        })
+    }
+    stop("All recount3 URLs failed. Check your internet connection.")
+}
+
+set_recount3_url()
+```
+
+```{r}
+# ── 1a. Get all human projects ────────────────────────────────────────
+cat("\nFetching all available human projects...\n")
+
+human_projects <- available_projects()
+
+cat("Total projects:", nrow(human_projects), "\n")
+cat("File source breakdown:\n")
+print(table(human_projects$file_source))
+# Should show: gtex  sra  tcga
+
+# Separate by source
+gtex_projects <- subset(human_projects, file_source == "gtex")
+tcga_projects <- subset(human_projects, file_source == "tcga")
+
+cat("\nAll GTEx tissue projects:\n")
+print(gtex_projects[, c("project", "n_samples")])
+
+cat("\nAll TCGA projects:\n")
+print(tcga_projects[, c("project", "n_samples")])
+```
+
+```{r}
+# ── 1b. Identify colon GTEx tissues ──────────────────────────────────
+cat("\nColon-related GTEx projects:\n")
+colon_gtex <- gtex_projects[
+    grepl("colon|sigmoid|transverse",
+          gtex_projects$project,
+          ignore.case = TRUE), ]
+print(colon_gtex[, c("project", "n_samples")])
+
+# Confirm the exact project names from the printed output
+# before running the downloads below
+
+```
+
+```{r}
+# ── 1c. Download GTEx Colon ──────────────────────────────────
+cat("\nDownloading GTEx Colon...\n")
+
+gtex_colon_info <- subset(human_projects,
+    project     == "COLON" &
+    file_source == "gtex"
+)
+if (nrow(gtex_colon_info) == 0)
+    stop("COLON not found — check project names printed above")
+
+rse_colon    <- create_rse(gtex_colon_info)
+counts_colon <- assay(rse_colon, "raw_counts")
+meta_sigmoid   <- colData(rse_colon)
+cat("  Samples:", ncol(counts_colon), "\n")
+cat("  Genes:  ", nrow(counts_colon), "\n")
+```
+
+```{r}
+# ── 1e. Download TCGA-COAD ────────────────────────────────────────────────────
+
+cat("\nDownloading TCGA-COAD...\n")
+
+# CRITICAL: must include project_type == "data_sources"
+coad_info <- subset(human_projects,
+    project      == "COAD"          &
+    file_source  == "tcga"          &
+    project_type == "data_sources"
+)
+
+cat("COAD project rows found:", nrow(coad_info), "\n")
+if (nrow(coad_info) == 0)
+    stop("TCGA-COAD not found — check available TCGA projects")
+
+rse_coad    <- create_rse(coad_info)
+counts_coad <- assay(rse_coad, "raw_counts")
+meta_coad   <- colData(rse_coad)
+
+# ── CRITICAL FIX: recount3 TCGA uses GDC UUIDs as column names ────────────────
+# NOT the familiar TCGA barcodes (TCGA-XX-XXXX-01A-...)
+# The TCGA barcode is stored in the metadata column: tcga.tcga_barcode
+# We extract the sample type code from THAT column instead
+
+cat("\nDiagnostic — checking column name format:\n")
+cat("  First colname:", colnames(counts_coad)[1], "\n")
+# You will see a UUID like: 43e715bf-28d9-4b5e-b762-8cd1b69a430e
+
+# Check the metadata column containing TCGA barcodes
+cat("  TCGA barcode example:", meta_coad$tcga.tcga_barcode[1], "\n")
+# You will see: TCGA-AA-3521-01A-01R-0821-07
+
+# Extract sample type from the TCGA barcode in metadata
+# Characters 14-15 of the TCGA barcode encode sample type:
+#   "01" = Primary Tumour
+#   "11" = Solid Tissue Normal
+tcga_barcodes_coad <- meta_coad$tcga.tcga_barcode
+sample_type_coad   <- substr(tcga_barcodes_coad, 14, 15)
+
+cat("  Sample type distribution:\n")
+print(table(sample_type_coad))
+
+# Now subset counts matrix using the sample type from metadata
+# The sample order in meta_coad matches the column order in counts_coad
+tumour_coad_counts <- counts_coad[, sample_type_coad == "01"]
+normal_coad_counts <- counts_coad[, sample_type_coad == "11"]
+
+cat("  TCGA-COAD tumour samples:", ncol(tumour_coad_counts), "\n")
+cat("  TCGA-COAD normal samples:", ncol(normal_coad_counts), "\n")
+# Expected: ~503 tumour, ~41 normal
+```
+
+```{r}
+# ── 1f. Download TCGA-READ ────────────────────────────────────────────────────
+
+cat("\nDownloading TCGA-READ...\n")
+
+read_info <- subset(human_projects,
+    project      == "READ"          &
+    file_source  == "tcga"          &
+    project_type == "data_sources"
+)
+
+cat("READ project rows found:", nrow(read_info), "\n")
+if (nrow(read_info) == 0)
+    stop("TCGA-READ not found — check available TCGA projects")
+
+rse_read    <- create_rse(read_info)
+counts_read <- assay(rse_read, "raw_counts")
+meta_read   <- colData(rse_read)
+
+# Same fix for READ
+tcga_barcodes_read <- meta_read$tcga.tcga_barcode
+sample_type_read   <- substr(tcga_barcodes_read, 14, 15)
+
+cat("  Sample type distribution:\n")
+print(table(sample_type_read))
+
+tumour_read_counts <- counts_read[, sample_type_read == "01"]
+normal_read_counts <- counts_read[, sample_type_read == "11"]
+
+cat("  TCGA-READ tumour samples:", ncol(tumour_read_counts), "\n")
+cat("  TCGA-READ normal samples:", ncol(normal_read_counts), "\n")
+# Expected: ~166 tumour, ~10 normal
+```
+
+```{r}
+# Check available TCGA barcode columns
+tcga_cols <- grep("barcode|tcga_barcode",
+                   colnames(meta_coad),
+                   ignore.case = TRUE,
+                   value = TRUE)
+cat("Available barcode columns:", tcga_cols, "\n")
+
+# If the column name differs from "tcga.tcga_barcode",
+# update the meta_coad$tcga.tcga_barcode references above
+# to use the actual column name printed here
+```
+
+```{r}
+# ── 1g. Summary ───────────────────────────────────────────────────────
+cat("\nData Acquisition Summary:\n")
+cat("  GTEx colon (normal):    ", ncol(counts_colon),    "\n")
+cat("  TCGA-COAD normal:         ", ncol(normal_coad_counts),"\n")
+cat("  TCGA-READ normal:         ", ncol(normal_read_counts),"\n")
+cat("  Total normal reference:   ",
+    ncol(counts_colon) +
+    ncol(normal_coad_counts) + ncol(normal_read_counts), "\n")
+cat("\n  TCGA-COAD tumour:         ", ncol(tumour_coad_counts), "\n")
+cat("  TCGA-READ tumour:         ", ncol(tumour_read_counts), "\n")
+```
+
+```{r}
+# Save immediately — protects against R session crashes during long downloads
+save(counts_colon,
+     normal_coad_counts, normal_read_counts,
+     tumour_coad_counts, tumour_read_counts,
+     meta_coad, meta_read,
+     file = "~/Desktop/COLORECTAL CANCER/LCP1-NET/all_raw_counts.RData")
+
+cat("\nAll raw data saved to ~/Desktop/COLORECTAL CANCER/LCP1-NET/all_raw_counts.RData\n")
+cat("Block 1 complete ✓\n")
+
+```
