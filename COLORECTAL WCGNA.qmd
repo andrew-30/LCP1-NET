@@ -65,7 +65,7 @@ suppressPackageStartupMessages({
 allowWGCNAThreads()
 ```
 
-BLOCK 1 — DATA ACQUISITION via recount3 (URL-fixed version)
+# **DATA ACQUISITION via recount3** 
 
 ```{r}
 cat("\nBLOCK 1: Data Acquisition\n")
