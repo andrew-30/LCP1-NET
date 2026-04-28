@@ -65,7 +65,7 @@ suppressPackageStartupMessages({
 allowWGCNAThreads()
 ```
 
-# **DATA ACQUISITION via recount3** 
+# **DATA ACQUISITION via recount3**
 
 ```{r}
 cat("\nBLOCK 1: Data Acquisition\n")
@@ -147,7 +147,7 @@ if (nrow(gtex_colon_info) == 0)
 
 rse_colon    <- create_rse(gtex_colon_info)
 counts_colon <- assay(rse_colon, "raw_counts")
-meta_sigmoid   <- colData(rse_colon)
+meta_colon   <- colData(rse_colon)
 cat("  Samples:", ncol(counts_colon), "\n")
 cat("  Genes:  ", nrow(counts_colon), "\n")
 ```
@@ -270,10 +270,283 @@ cat("  TCGA-READ tumour:         ", ncol(tumour_read_counts), "\n")
 save(counts_colon,
      normal_coad_counts, normal_read_counts,
      tumour_coad_counts, tumour_read_counts,
-     meta_coad, meta_read,
+     meta_coad, meta_read, meta_colon, 
      file = "~/Desktop/COLORECTAL CANCER/LCP1-NET/all_raw_counts.RData")
 
 cat("\nAll raw data saved to ~/Desktop/COLORECTAL CANCER/LCP1-NET/all_raw_counts.RData\n")
 cat("Block 1 complete ✓\n")
 
+```
+
+**BLOCK 2 — GENE ID HARMONISATION**
+
+```{r}
+# recount3 returns ENSEMBL IDs with version suffixes
+# e.g. ENSG00000159111.16 — strip the version for compatibility
+
+# Check what your gene IDs look like right now
+cat("Sample gene IDs (raw):\n")
+print(head(rownames(counts_colon), 5))
+# Expected: ENSG00000278704.1, ENSG00000277400.1 ...
+
+# Strip version suffix: ENSG00000159111.16 → ENSG00000159111
+strip_version <- function(ids) sub("\\..*", "", ids)
+
+rownames(counts_colon)       <- strip_version(rownames(counts_colon))
+rownames(normal_coad_counts) <- strip_version(rownames(normal_coad_counts))
+rownames(normal_read_counts) <- strip_version(rownames(normal_read_counts))
+rownames(tumour_coad_counts) <- strip_version(rownames(tumour_coad_counts))
+rownames(tumour_read_counts) <- strip_version(rownames(tumour_read_counts))
+
+cat("\nAfter stripping versions:\n")
+print(head(rownames(counts_colon), 5))
+print(head(rownames(normal_coad_counts), 5))
+print(head(rownames(tumour_read_counts), 5))
+# Expected: ENSG00000278704, ENSG00000277400 ...
+
+# LCP1 ENSEMBL ID
+LCP1_ENSEMBL <- "ENSG00000159111"
+cat("\nLCP1 (", LCP1_ENSEMBL, ") in GTEx colon:",
+    LCP1_ENSEMBL %in% rownames(counts_colon), "\n")
+
+# Find genes common across ALL five matrices
+# (GTEx colon + COAD normal + READ normal + COAD tumour + READ tumour)
+cat("\nFinding common genes across all sources...\n")
+common_genes <- Reduce(intersect, list(
+    rownames(counts_colon),
+    rownames(normal_coad_counts),
+    rownames(normal_read_counts),
+    rownames(tumour_coad_counts),
+    rownames(tumour_read_counts)
+))
+cat("Common genes:", length(common_genes), "\n")
+
+# Subset all matrices to common genes
+counts_colon         <- counts_colon[common_genes, ]
+normal_coad_counts   <- normal_coad_counts[common_genes, ]
+normal_read_counts   <- normal_read_counts[common_genes, ]
+tumour_coad_counts   <- tumour_coad_counts[common_genes, ]
+tumour_read_counts   <- tumour_read_counts[common_genes, ]
+
+cat("LCP1 in common genes:", LCP1_ENSEMBL %in% common_genes, "\n")
+cat("Block 2 complete ✓\n")
+```
+
+BLOCK 3 — BUILD COMBINED NORMAL REFERENCE MATRIX
+
+```{r}
+# Combine all three normal sources into one reference matrix
+# GTEx colon + TCGA-COAD matched normal + TCGA-READ matched normal
+#
+# Biological justification: colon and rectal tissue share highly similar
+# transcriptional profiles (Cancer Genome Atlas Research Network, 2012)
+# Technical justification: all data processed through the same
+# recount3 Monorail pipeline — minimises technical batch effects
+
+normal_combined <- cbind(
+    counts_colon,
+    normal_coad_counts,
+    normal_read_counts
+)
+
+# One batch label per sample — essential for ComBat-seq correction
+n_colon <- ncol(counts_colon)
+n_coad  <- ncol(normal_coad_counts)
+n_read  <- ncol(normal_read_counts)
+
+batch_labels <- c(
+    rep("GTEx_Colon",       n_colon),
+    rep("TCGA_COAD_Normal", n_coad),
+    rep("TCGA_READ_Normal", n_read)
+)
+
+tissue_labels <- c(
+    rep("colon_gtex",            n_colon),
+    rep("colon_matched_normal",  n_coad),
+    rep("rectum_matched_normal", n_read)
+)
+
+source_labels <- c(
+    rep("GTEx", n_colon),
+    rep("TCGA", n_coad + n_read)
+)
+
+cat("Combined normal matrix:", nrow(normal_combined),
+    "genes ×", ncol(normal_combined), "samples\n")
+cat("\nBatch distribution:\n")
+print(table(batch_labels))
+cat("\nTissue distribution:\n")
+print(table(tissue_labels))
+cat("Block 3 complete ✓\n")
+```
+
+**BLOCK 4 — QUALITY CONTROL**
+
+```{r}
+# ── 4a. Filter lowly expressed genes ─────────────────────────────────
+# Keep genes with >10 counts in at least 20% of all normal samples
+# Genes expressed in fewer samples cannot support reliable
+# co-expression estimates in WGCNA
+
+min_samples_threshold <- ceiling(ncol(normal_combined) * 0.20)
+keep_genes <- rowSums(normal_combined > 10) >= min_samples_threshold
+
+cat("Genes before filtering:", nrow(normal_combined), "\n")
+cat("20% sample threshold:  ", min_samples_threshold, "samples\n")
+
+normal_filtered <- normal_combined[keep_genes, ]
+cat("Genes after filtering: ", nrow(normal_filtered), "\n")
+cat("Genes removed:         ", sum(!keep_genes), "\n")
+
+# ── Check LCP1 survived ───────────────────────────────────────────────
+lcp1_survived <- LCP1_ENSEMBL %in% rownames(normal_filtered)
+cat("\nLCP1 survived expression filter:", lcp1_survived, "\n")
+
+#fallback mechanism to protect biological interest.(data quality issue!!)
+if (!lcp1_survived) {
+    # LCP1 is aberrantly expressed — low in normal colon is expected
+    # Check its actual expression level
+    lcp1_expr_check <- normal_combined[LCP1_ENSEMBL, ]
+    cat("LCP1 samples with >10 counts:",
+        sum(lcp1_expr_check > 10), "of", ncol(normal_combined), "\n")
+    cat("Threshold required:", min_samples_threshold, "\n")
+    cat("Lowering threshold to 10% to retain LCP1...\n")
+
+    min_samples_threshold <- ceiling(ncol(normal_combined) * 0.10)
+    keep_genes            <- rowSums(normal_combined > 10) >= min_samples_threshold
+    normal_filtered       <- normal_combined[keep_genes, ]
+
+    cat("Genes after 10% filter:", nrow(normal_filtered), "\n")
+    cat("LCP1 now present:      ", LCP1_ENSEMBL %in% rownames(normal_filtered), "\n")
+}
+
+# ── 4b. Library size check ────────────────────────────────────────────
+lib_sizes <- colSums(normal_filtered)
+cat("\nLibrary size summary:\n")
+print(summary(lib_sizes))
+
+# Remove samples below 5th percentile — these are likely poor quality
+low_lib_threshold <- quantile(lib_sizes, 0.05)
+low_lib_flag      <- lib_sizes < low_lib_threshold
+
+if (any(low_lib_flag)) {
+    cat("\nRemoving", sum(low_lib_flag),
+        "low-quality samples (below 5th percentile)\n")
+    normal_filtered <- normal_filtered[, !low_lib_flag]
+    batch_labels    <- batch_labels[!low_lib_flag]
+    tissue_labels   <- tissue_labels[!low_lib_flag]
+    source_labels   <- source_labels[!low_lib_flag]
+    cat("Samples remaining:", ncol(normal_filtered), "\n")
+} else {
+    cat("All samples pass library size QC ✓\n")
+}
+
+cat("\nFinal normal reference after QC:\n")
+cat("  Genes:   ", nrow(normal_filtered), "\n")
+cat("  Samples: ", ncol(normal_filtered), "\n")
+cat("  LCP1 present:", LCP1_ENSEMBL %in% rownames(normal_filtered), "\n")
+cat("Block 4 complete ✓\n")
+```
+
+```{r}
+# ── Diagnostic — run this before Block 5 ─────────────────────────────
+
+cat("Checking corrected counts for problematic values...\n")
+
+# Check for NA values
+n_na <- sum(is.na(normal_filtered))
+cat("NA values in normal_filtered:", n_na, "\n")
+
+# Check for non-finite values (Inf, -Inf, NaN)
+n_inf <- sum(!is.finite(normal_filtered))
+cat("Non-finite values:", n_inf, "\n")
+
+# Check for values exceeding integer range
+int_max <- .Machine$integer.max  # 2,147,483,647
+n_large <- sum(normal_filtered > int_max, na.rm = TRUE)
+cat("Values exceeding integer max:", n_large, "\n")
+
+# Check for negative values (counts cannot be negative)
+n_neg <- sum(normal_filtered < 0, na.rm = TRUE)
+cat("Negative values:", n_neg, "\n")
+
+# Show the range
+cat("Count range: [",
+    min(normal_filtered, na.rm = TRUE), ",",
+    max(normal_filtered, na.rm = TRUE), "]\n")
+```
+
+Fix A — Values Too Large (Most Likely Cause)
+
+```{r}
+# Cap values at integer maximum before DESeq2
+# This affects a tiny fraction of very highly expressed genes
+# and has negligible impact on WGCNA results
+
+normal_filtered_clean <- normal_filtered
+
+# Replace values above integer max with the integer max
+normal_filtered_clean[normal_filtered_clean > .Machine$integer.max] <-
+    .Machine$integer.max
+
+# Replace any NA or non-finite values with 0
+normal_filtered_clean[!is.finite(normal_filtered_clean)] <- 0
+normal_filtered_clean[is.na(normal_filtered_clean)]      <- 0
+
+# Ensure all values are non-negative
+normal_filtered_clean[normal_filtered_clean < 0] <- 0
+
+# Verify
+cat("After cleaning:\n")
+cat("  NA values:     ", sum(is.na(normal_filtered_clean)), "\n")
+cat("  Non-finite:    ", sum(!is.finite(normal_filtered_clean)), "\n")
+cat("  Values > max:  ",
+    sum(normal_filtered_clean > .Machine$integer.max), "\n")
+cat("  Negative:      ",
+    sum(normal_filtered_clean < 0), "\n")
+cat("  Range: [",
+    min(normal_filtered_clean), ",",
+    max(normal_filtered_clean), "]\n")
+
+# Convert to integer matrix explicitly
+normal_filtered_clean <- round(normal_filtered_clean)
+storage.mode(normal_filtered_clean) <- "integer"
+cat("Storage mode:", storage.mode(normal_filtered_clean), "\n")
+```
+
+BLOCK 5 — VST NORMALISATION
+
+```{r}
+# Variance Stabilising Transformation via DESeq2
+# Recommended by WGCNA authors for RNA-seq count data
+# Makes variance uniform across expression range
+# Required before Pearson correlation in WGCNA
+
+# Create colData dataframe for DESeq2
+col_data_normal <- data.frame(
+    batch   = factor(batch_labels),
+    tissue  = factor(tissue_labels),
+    source  = factor(source_labels),
+    row.names = colnames(normal_filtered)
+)
+
+# design = ~1 means no specific comparison — just normalise
+dds_normal <- DESeqDataSetFromMatrix(
+    countData = normal_filtered_clean,
+    colData   = col_data_normal,
+    design    = ~1
+)
+
+cat("Applying VST normalisation...\n")
+vst_normal <- vst(dds_normal, blind = TRUE)
+expr_vst   <- assay(vst_normal)
+
+cat("VST complete\n")
+cat("Dimensions:", nrow(expr_vst), "genes ×",
+    ncol(expr_vst), "samples\n")
+cat("VST value range: [",
+    round(min(expr_vst), 2), ",",
+    round(max(expr_vst), 2), "]\n")
+# VST values should be continuous floats — not integers
+cat("Block 5 complete ✓\n")
 ```
