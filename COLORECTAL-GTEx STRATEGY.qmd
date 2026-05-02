@@ -603,7 +603,7 @@ if (any(outlier_flag)) {
 ```
 
 ```{r}
-# ── Check 2: Scale-free topology pre-check ────────────────────────────
+# ── Check 2: Scale-free topology pre-check ───────────────────────────
 cat("expr_corrected_s3 dimensions:", dim(expr_corrected_s3), "\n")
 
 # Transpose for WGCNA format (rows = samples, columns = genes)
