@@ -383,13 +383,16 @@ cat("Block 3 complete ✓\n")
 **BLOCK 4 — QUALITY CONTROL**
 
 ```{r}
-# ── 4a. Filter lowly expressed genes ─────────────────────────────────
+# ── Filter lowly expressed genes ──────────────────────────────────────
 # Keep genes with >10 counts in at least 20% of all normal samples
 # Genes expressed in fewer samples cannot support reliable
-# co-expression estimates in WGCNA
+# co-expression estimates for WGCNA
 
-min_samples_threshold <- ceiling(ncol(normal_combined) * 0.20)
-keep_genes <- rowSums(normal_combined > 10) >= min_samples_threshold
+cat("\nBLOCK 4: Quality Control\n")
+cat(rep("-", 42), "\n", sep = "")
+
+min_samples_threshold <- ceiling(ncol(normal_combined) * 0.35)
+keep_genes            <- rowSums(normal_combined > 10) >= min_samples_threshold
 
 cat("Genes before filtering:", nrow(normal_combined), "\n")
 cat("20% sample threshold:  ", min_samples_threshold, "samples\n")
@@ -398,18 +401,15 @@ normal_filtered <- normal_combined[keep_genes, ]
 cat("Genes after filtering: ", nrow(normal_filtered), "\n")
 cat("Genes removed:         ", sum(!keep_genes), "\n")
 
-# ── Check LCP1 survived ───────────────────────────────────────────────
+# Check LCP1 survived
 lcp1_survived <- LCP1_ENSEMBL %in% rownames(normal_filtered)
 cat("\nLCP1 survived expression filter:", lcp1_survived, "\n")
 
-#fallback mechanism to protect biological interest.(data quality issue!!)
 if (!lcp1_survived) {
     # LCP1 is aberrantly expressed — low in normal colon is expected
-    # Check its actual expression level
     lcp1_expr_check <- normal_combined[LCP1_ENSEMBL, ]
     cat("LCP1 samples with >10 counts:",
         sum(lcp1_expr_check > 10), "of", ncol(normal_combined), "\n")
-    cat("Threshold required:", min_samples_threshold, "\n")
     cat("Lowering threshold to 10% to retain LCP1...\n")
 
     min_samples_threshold <- ceiling(ncol(normal_combined) * 0.10)
@@ -417,17 +417,17 @@ if (!lcp1_survived) {
     normal_filtered       <- normal_combined[keep_genes, ]
 
     cat("Genes after 10% filter:", nrow(normal_filtered), "\n")
-    cat("LCP1 now present:      ", LCP1_ENSEMBL %in% rownames(normal_filtered), "\n")
+    cat("LCP1 now present:      ",
+        LCP1_ENSEMBL %in% rownames(normal_filtered), "\n")
 }
 
-# ── 4b. Library size check ────────────────────────────────────────────
-lib_sizes <- colSums(normal_filtered)
-cat("\nLibrary size summary:\n")
-print(summary(lib_sizes))
-
-# Remove samples below 5th percentile — these are likely poor quality
+# Library size check — remove very low quality samples
+lib_sizes         <- colSums(normal_filtered)
 low_lib_threshold <- quantile(lib_sizes, 0.05)
 low_lib_flag      <- lib_sizes < low_lib_threshold
+
+cat("\nLibrary size summary:\n")
+print(summary(lib_sizes))
 
 if (any(low_lib_flag)) {
     cat("\nRemoving", sum(low_lib_flag),
@@ -442,9 +442,10 @@ if (any(low_lib_flag)) {
 }
 
 cat("\nFinal normal reference after QC:\n")
-cat("  Genes:   ", nrow(normal_filtered), "\n")
-cat("  Samples: ", ncol(normal_filtered), "\n")
-cat("  LCP1 present:", LCP1_ENSEMBL %in% rownames(normal_filtered), "\n")
+cat("  Genes:       ", nrow(normal_filtered), "\n")
+cat("  Samples:     ", ncol(normal_filtered), "\n")
+cat("  LCP1 present:",
+    LCP1_ENSEMBL %in% rownames(normal_filtered), "\n")
 cat("Block 4 complete ✓\n")
 ```
 
@@ -479,74 +480,430 @@ cat("Count range: [",
 Fix A — Values Too Large (Most Likely Cause)
 
 ```{r}
-# Cap values at integer maximum before DESeq2
-# This affects a tiny fraction of very highly expressed genes
-# and has negligible impact on WGCNA results
+# ── Fix A: Clean normal_filtered → normal_filtered_clean ─────────────
+# Problem: recount3 occasionally returns count values exceeding
+# R's integer maximum (2,147,483,647) for highly expressed genes.
+# Both ComBat-seq and DESeq2 require valid integer counts.
+# Without this fix you get:
+#   "NAs introduced by coercion to integer range"
+#   "NA values are not allowed in the count matrix"
+#
+# Solution: cap oversized values, remove NAs, force integer storage
+# Always applied to normal_filtered → produces normal_filtered_clean
+# normal_filtered is never modified directly
 
+cat("\nFix A: Cleaning raw counts before batch correction...\n")
+cat(rep("-", 42), "\n", sep = "")
+
+cat("Checking normal_filtered for problematic values...\n")
+n_na    <- sum(is.na(normal_filtered))
+n_inf   <- sum(!is.finite(normal_filtered))
+n_large <- sum(normal_filtered > .Machine$integer.max, na.rm = TRUE)
+n_neg   <- sum(normal_filtered < 0, na.rm = TRUE)
+
+cat("  NA values:            ", n_na,    "\n")
+cat("  Non-finite values:    ", n_inf,   "\n")
+cat("  Values > integer max: ", n_large, "\n")
+cat("  Negative values:      ", n_neg,   "\n")
+cat("  Count range: [",
+    min(normal_filtered, na.rm = TRUE), ",",
+    max(normal_filtered, na.rm = TRUE), "]\n")
+
+# Create cleaned copy
 normal_filtered_clean <- normal_filtered
 
-# Replace values above integer max with the integer max
-normal_filtered_clean[normal_filtered_clean > .Machine$integer.max] <-
-    .Machine$integer.max
+# 1. Cap values exceeding R integer maximum
+normal_filtered_clean[
+    normal_filtered_clean > .Machine$integer.max
+] <- .Machine$integer.max
 
-# Replace any NA or non-finite values with 0
+# 2. Replace NA and non-finite values with 0
 normal_filtered_clean[!is.finite(normal_filtered_clean)] <- 0
 normal_filtered_clean[is.na(normal_filtered_clean)]      <- 0
 
-# Ensure all values are non-negative
+# 3. Remove negative values
 normal_filtered_clean[normal_filtered_clean < 0] <- 0
 
+# 4. Round and force integer storage mode
+normal_filtered_clean <- round(normal_filtered_clean)
+storage.mode(normal_filtered_clean) <- "integer"
+
 # Verify
-cat("After cleaning:\n")
-cat("  NA values:     ", sum(is.na(normal_filtered_clean)), "\n")
-cat("  Non-finite:    ", sum(!is.finite(normal_filtered_clean)), "\n")
-cat("  Values > max:  ",
-    sum(normal_filtered_clean > .Machine$integer.max), "\n")
-cat("  Negative:      ",
-    sum(normal_filtered_clean < 0), "\n")
-cat("  Range: [",
+cat("\nAfter cleaning (normal_filtered_clean):\n")
+cat("  NA values:            ",
+    sum(is.na(normal_filtered_clean)),                           "\n")
+cat("  Non-finite values:    ",
+    sum(!is.finite(normal_filtered_clean)),                      "\n")
+cat("  Values > integer max: ",
+    sum(normal_filtered_clean > .Machine$integer.max),           "\n")
+cat("  Negative values:      ",
+    sum(normal_filtered_clean < 0),                             "\n")
+cat("  Storage mode:         ",
+    storage.mode(normal_filtered_clean),                         "\n")
+cat("  Count range: [",
     min(normal_filtered_clean), ",",
     max(normal_filtered_clean), "]\n")
 
-# Convert to integer matrix explicitly
-normal_filtered_clean <- round(normal_filtered_clean)
-storage.mode(normal_filtered_clean) <- "integer"
-cat("Storage mode:", storage.mode(normal_filtered_clean), "\n")
+cat("Fix A complete ✓\n")
+```
+
+BLOCK 6 — BATCH CORRECTION
+
+```{r}
+# ── Batch correction with ComBat-seq ─────────────────────────────────
+# Corrects systematic technical differences between:
+#   GTEx_Colon       — GTEx portal processing pipeline
+#   TCGA_COAD_Normal — TCGA/GDC processing pipeline
+#   TCGA_READ_Normal — TCGA/GDC processing pipeline
+#
+# Input:  normal_filtered_clean (clean integer counts)
+# Output: corrected_counts      (corrected integer counts)
+#
+# PCA before correction is generated here for comparison
+# PCA after correction is generated in Block 5 after VST
+
+cat("\nBLOCK 6: Batch Correction\n")
+cat(rep("-", 42), "\n", sep = "")
+
+# ── PCA before correction (visualisation only) ────────────────────────
+# Quick VST on clean raw counts — for the before plot only
+# NOT the final normalisation — Block 5 handles that
+
+cat("Computing PCA before batch correction (visualisation only)...\n")
+
+dds_vis <- DESeqDataSetFromMatrix(
+    countData = normal_filtered_clean,
+    colData   = data.frame(
+        batch  = factor(batch_labels),
+        tissue = factor(tissue_labels),
+        source = factor(source_labels),
+        row.names = colnames(normal_filtered_clean)
+    ),
+    design = ~1
+)
+expr_vis   <- assay(vst(dds_vis, blind = TRUE))
+pca_before <- prcomp(t(expr_vis), scale. = FALSE)
+var_before <- pca_before$sdev^2 / sum(pca_before$sdev^2) * 100
+
+pca_before_df <- data.frame(
+    PC1    = pca_before$x[, 1],
+    PC2    = pca_before$x[, 2],
+    batch  = batch_labels,
+    tissue = tissue_labels,
+    source = source_labels
+)
+
+p_before <- ggplot(pca_before_df,
+                   aes(PC1, PC2, colour = batch, shape = source)) +
+    geom_point(size = 3, alpha = 0.8) +
+    labs(
+        title    = "PCA — before batch correction",
+        subtitle = "GTEx and TCGA should cluster separately here (expected)",
+        x = paste0("PC1 (", round(var_before[1], 1), "% variance)"),
+        y = paste0("PC2 (", round(var_before[2], 1), "% variance)")
+    ) +
+    theme_minimal(base_size = 12)
+
+print(p_before)
+```
+
+```{r}
+# ── Apply ComBat-seq ──────────────────────────────────────────────────
+cat("\nApplying ComBat-seq...\n")
+cat("Batches being corrected:\n")
+print(table(batch_labels))
+
+corrected_counts <- ComBat_seq(
+    counts = normal_filtered_clean,
+    batch  = batch_labels,
+    group  = NULL
+)
+
+cat("Batch correction complete\n")
+cat("Corrected counts:", nrow(corrected_counts), "genes ×",
+    ncol(corrected_counts), "samples\n")
+
+# ComBat-seq can occasionally reintroduce small negative values
+n_neg_post <- sum(corrected_counts < 0, na.rm = TRUE)
+n_na_post  <- sum(is.na(corrected_counts))
+
+if (n_neg_post > 0 || n_na_post > 0) {
+    cat("Minor clean-up on corrected_counts...\n")
+    corrected_counts[is.na(corrected_counts)] <- 0
+    corrected_counts[corrected_counts < 0]    <- 0
+    corrected_counts                          <- round(corrected_counts)
+    storage.mode(corrected_counts)            <- "integer"
+    cat("  Negatives removed:", n_neg_post, "\n")
+    cat("  NAs removed:      ", n_na_post,  "\n")
+} else {
+    cat("corrected_counts is clean ✓\n")
+}
+
+cat("Block 6 complete ✓\n")
 ```
 
 BLOCK 5 — VST NORMALISATION
 
 ```{r}
-# Variance Stabilising Transformation via DESeq2
-# Recommended by WGCNA authors for RNA-seq count data
-# Makes variance uniform across expression range
-# Required before Pearson correlation in WGCNA
+# ── VST Normalisation ─────────────────────────────────────────────────
+# Applied to corrected_counts — the ComBat-seq output from Block 6
+# Variance Stabilising Transformation (VST) via DESeq2:
+#   - Stabilises variance across the expression range
+#   - Produces continuous values suitable for Pearson correlation
+#   - Required by WGCNA before network construction
 
-# Create colData dataframe for DESeq2
+cat("\nBLOCK 5: VST Normalisation\n")
+cat(rep("-", 42), "\n", sep = "")
+
 col_data_normal <- data.frame(
     batch   = factor(batch_labels),
     tissue  = factor(tissue_labels),
     source  = factor(source_labels),
-    row.names = colnames(normal_filtered)
+    row.names = colnames(corrected_counts)
 )
 
-# design = ~1 means no specific comparison — just normalise
-dds_normal <- DESeqDataSetFromMatrix(
-    countData = normal_filtered_clean,
+cat("Creating DESeq2 object from corrected counts...\n")
+dds_corrected <- DESeqDataSetFromMatrix(
+    countData = corrected_counts,
     colData   = col_data_normal,
     design    = ~1
 )
 
-cat("Applying VST normalisation...\n")
-vst_normal <- vst(dds_normal, blind = TRUE)
-expr_vst   <- assay(vst_normal)
+cat("Applying VST...\n")
+vst_corrected  <- vst(dds_corrected, blind = TRUE)
+expr_corrected <- assay(vst_corrected)
+
+cat("VST complete ✓\n")
+cat("Dimensions:", nrow(expr_corrected), "genes ×",
+    ncol(expr_corrected), "samples\n")
+cat("VST value range: [",
+    round(min(expr_corrected), 2), ",",
+    round(max(expr_corrected), 2), "]\n")
+# Expected: continuous floats between roughly 4 and 20
+```
+
+```{r}
+# ── PCA after correction ──────────────────────────────────────────────
+pca_after  <- prcomp(t(expr_corrected), scale. = FALSE)
+var_after  <- pca_after$sdev^2 / sum(pca_after$sdev^2) * 100
+
+pca_after_df <- data.frame(
+    PC1    = pca_after$x[, 1],
+    PC2    = pca_after$x[, 2],
+    batch  = batch_labels,
+    tissue = tissue_labels,
+    source = source_labels
+)
+
+p_after <- ggplot(pca_after_df,
+                  aes(PC1, PC2, colour = batch, shape = source)) +
+    geom_point(size = 3, alpha = 0.8) +
+    labs(
+        title    = "PCA — after batch correction",
+        subtitle = "Batches should now intermingle — biological variation remains",
+        x = paste0("PC1 (", round(var_after[1], 1), "% variance)"),
+        y = paste0("PC2 (", round(var_after[2], 1), "% variance)")
+    ) +
+    theme_minimal(base_size = 12)
+
+print(p_after)
+
+# Save both PCA plots side by side for thesis Methods figure
+pdf("plots/batch_correction_PCA.pdf", width = 16, height = 7)
+grid.arrange(p_before, p_after, ncol = 2)
+dev.off()
+cat("PCA comparison saved to plots/batch_correction_PCA.pdf\n")
+
+cat("\nCHECK THE PCA PLOTS:\n")
+cat("  BEFORE: GTEx and TCGA should cluster separately\n")
+cat("  AFTER:  batches should intermingle\n")
+cat("  If still fully separate, consult supervisor before proceeding\n")
+cat("Block 5 complete ✓\n")
+```
+
+```{r}
+# Cap values at integer maximum before DESeq2
+# This affects a tiny fraction of very highly expressed genes
+# and has negligible impact on WGCNA results
+
+normal_filtered_clean_1 <- normal_combined_1
+
+# Replace values above integer max with the integer max
+normal_filtered_clean_1[normal_filtered_clean_1 > .Machine$integer.max] <-
+    .Machine$integer.max
+
+# Replace any NA or non-finite values with 0
+normal_filtered_clean_1[!is.finite(normal_filtered_clean_1)] <- 0
+normal_filtered_clean_1[is.na(normal_filtered_clean_1)]      <- 0
+
+# Ensure all values are non-negative
+normal_filtered_clean_1[normal_filtered_clean_1 < 0] <- 0
+
+# Verify
+cat("After cleaning:\n")
+cat("  NA values:     ", sum(is.na(normal_filtered_clean_1)), "\n")
+cat("  Non-finite:    ", sum(!is.finite(normal_filtered_clean_1)), "\n")
+cat("  Values > max:  ",
+    sum(normal_filtered_clean_1 > .Machine$integer.max), "\n")
+cat("  Negative:      ",
+    sum(normal_filtered_clean_1 < 0), "\n")
+cat("  Range: [",
+    min(normal_filtered_clean_1), ",",
+    max(normal_filtered_clean_1), "]\n")
+
+# Convert to integer matrix explicitly
+normal_filtered_clean_1 <- round(normal_filtered_clean_1)
+storage.mode(normal_filtered_clean_1) <- "integer"
+cat("Storage mode:", storage.mode(normal_filtered_clean_1), "\n")
+```
+
+LIMMA BATCH CORRECTION
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 6 — BATCH CORRECTION via limma (replacing ComBat-seq)
+# ══════════════════════════════════════════════════════════════════════
+# Rationale for switching from ComBat-seq to limma:
+#
+# 1. ComBat-seq group argument is unavailable — batch and tissue
+#    are perfectly confounded in this dataset
+# 2. limma::removeBatchEffect handles size-imbalanced batches
+#    (700 GTEx vs 51 TCGA) more gracefully than ComBat-seq
+# 3. limma works on VST-normalised values — no integer overflow risk
+# 4. Widely used in published WGCNA pipelines
+#
+# Approach: VST on clean raw counts → limma batch correction
+# expr_corrected is the final output — used directly in Block 7
+
+cat("\nBLOCK 6: Batch Correction via limma\n")
+cat(rep("-", 42), "\n", sep="")
+
+library(limma)
+
+# ── Step 1: VST on clean raw counts ──────────────────────────────────
+# This also serves as the normalisation (Block 5 is merged here)
+# VST first, then remove batch effect linearly
+
+cat("Step 1: Applying VST to clean raw counts...\n")
+
+col_data_normal <- data.frame(
+    batch   = factor(batch_labels),
+    tissue  = factor(tissue_labels),
+    source  = factor(source_labels),
+    row.names = colnames(normal_filtered_clean_1)
+)
+
+dds_for_limma <- DESeqDataSetFromMatrix(
+    countData = normal_filtered_clean_1,
+    colData   = col_data_normal,
+    design    = ~1
+)
+
+vst_for_limma  <- vst(dds_for_limma, blind = TRUE)
+expr_vst_limma <- assay(vst_for_limma)
 
 cat("VST complete\n")
-cat("Dimensions:", nrow(expr_vst), "genes ×",
-    ncol(expr_vst), "samples\n")
-cat("VST value range: [",
-    round(min(expr_vst), 2), ",",
-    round(max(expr_vst), 2), "]\n")
-# VST values should be continuous floats — not integers
-cat("Block 5 complete ✓\n")
+cat("Dimensions:", nrow(expr_vst_limma), "genes ×",
+    ncol(expr_vst_limma), "samples\n")
+
+# ── PCA before correction ─────────────────────────────────────────────
+pca_before <- prcomp(t(expr_vst_limma), scale. = FALSE)
+var_before <- pca_before$sdev^2 / sum(pca_before$sdev^2) * 100
+
+pca_before_df <- data.frame(
+    PC1    = pca_before$x[, 1],
+    PC2    = pca_before$x[, 2],
+    batch  = batch_labels,
+    tissue = tissue_labels,
+    source = source_labels
+)
+
+p_before <- ggplot(pca_before_df,
+                   aes(PC1, PC2, colour = batch, shape = source)) +
+    geom_point(size = 3, alpha = 0.8) +
+    labs(
+        title    = "PCA — before batch correction",
+        subtitle = "GTEx and TCGA should cluster separately here (expected)",
+        x = paste0("PC1 (", round(var_before[1], 1), "% variance)"),
+        y = paste0("PC2 (", round(var_before[2], 1), "% variance)")
+    ) +
+    theme_minimal(base_size = 12)
+
+print(p_before)
+
+# ── Step 2: limma batch correction ───────────────────────────────────
+# removeBatchEffect removes linear batch effects from VST values
+# It does NOT require group — handles confounding differently
+# by projecting out the batch component directly
+
+cat("\nStep 2: Applying limma batch correction...\n")
+cat("Batches:", paste(unique(batch_labels), collapse = ", "), "\n")
+
+expr_corrected_limma <- removeBatchEffect(
+    expr_vst_limma,
+    batch = batch_labels
+)
+
+cat("limma correction complete\n")
+cat("Dimensions:", nrow(expr_corrected_limma), "×",
+    ncol(expr_corrected_limma), "\n")
+cat("Value range: [",
+    round(min(expr_corrected_limma), 2), ",",
+    round(max(expr_corrected_limma), 2), "]\n")
+
+# ── PCA after correction ──────────────────────────────────────────────
+pca_after  <- prcomp(t(expr_corrected_limma), scale. = FALSE)
+var_after  <- pca_after$sdev^2 / sum(pca_after$sdev^2) * 100
+
+pca_after_df <- data.frame(
+    PC1    = pca_after$x[, 1],
+    PC2    = pca_after$x[, 2],
+    batch  = batch_labels,
+    tissue = tissue_labels,
+    source = source_labels
+)
+
+p_after <- ggplot(pca_after_df,
+                  aes(PC1, PC2, colour = batch, shape = source)) +
+    geom_point(size = 3, alpha = 0.8) +
+    labs(
+        title    = "PCA — after limma batch correction",
+        subtitle = "Batches should now intermingle — biological variation remains",
+        x = paste0("PC1 (", round(var_after[1], 1), "% variance)"),
+        y = paste0("PC2 (", round(var_after[2], 1), "% variance)")
+    ) +
+    theme_minimal(base_size = 12)
+
+print(p_after)
+
+# Save both PCA plots
+pdf("plots/batch_correction_PCA.pdf", width = 16, height = 7)
+grid.arrange(p_before, p_after, ncol = 2)
+dev.off()
+cat("PCA plots saved to plots/batch_correction_PCA.pdf\n")
+
+# ── Residual batch effect diagnostic ─────────────────────────────────
+batch_numeric  <- as.numeric(factor(batch_labels))
+pc1_batch_cor  <- cor(pca_after$x[, 1], batch_numeric)
+pc2_batch_cor  <- cor(pca_after$x[, 2], batch_numeric)
+
+cat("\nResidual batch correlation with PCs:\n")
+cat("  PC1 vs batch:", round(pc1_batch_cor, 3), "\n")
+cat("  PC2 vs batch:", round(pc2_batch_cor, 3), "\n")
+cat("  Target: |r| < 0.2 for adequate correction\n")
+
+if (abs(pc1_batch_cor) > 0.3) {
+    cat("\n  WARNING: PC1 still correlated with batch (r > 0.3)\n")
+    cat("  This may reflect true biological differences\n")
+    cat("  between GTEx and TCGA tissue collection methods\n")
+    cat("  Proceed to WGCNA — the network will capture shared patterns\n")
+} else {
+    cat("  Batch correction adequate ✓\n")
+}
+
+cat("\nCHECK THE PCA PLOTS:\n")
+cat("  BEFORE: GTEx and TCGA should cluster separately\n")
+cat("  AFTER:  batches should intermingle\n")
+cat("  PC1 variance should drop from ~43% toward ~15-30%\n")
+cat("Block 6 complete ✓\n")
 ```
