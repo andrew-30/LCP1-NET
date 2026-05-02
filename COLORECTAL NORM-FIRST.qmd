@@ -4,4 +4,466 @@ format: html
 editor: visual
 ---
 
-## 
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# LCP1-NET: WGCNA Pipeline — Strategy 2
+# Within-dataset CPM normalisation before combination
+#
+# Comparison pipeline against Strategy 1
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Load libraries ────────────────────────────────────────────────────
+library(ggplot2)
+library(jsonlite)
+library(limma)
+suppressPackageStartupMessages({
+    library(recount3)
+    library(DESeq2)
+    library(WGCNA)
+    library(flashClust)
+    library(SummarizedExperiment)
+    library(gridExtra)
+})
+
+allowWGCNAThreads()
+
+# ── Paths ─────────────────────────────────────────────────────────────
+BASE_PATH_S2 <- "~/Desktop/COLORECTAL CANCER/LCP1-NET/strategy2"
+
+dir.create(file.path(BASE_PATH_S2, "data/wgcna"),     recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(BASE_PATH_S2, "data/processed"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(BASE_PATH_S2, "ml_outputs"),     recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(BASE_PATH_S2, "plots"),          recursive = TRUE, showWarnings = FALSE)
+
+LCP1_ENSEMBL <- "ENSG00000159111"
+
+cat("Strategy 2 environment ready ✓\n")
+cat(rep("=", 60), "\n", sep="")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 1 — DATA ACQUISITION
+# Identical to Strategy 1 — reuse saved data if already downloaded
+# ══════════════════════════════════════════════════════════════════════
+
+cat("\nBLOCK 1: Data Acquisition\n")
+cat(rep("-", 42), "\n", sep="")
+
+# ── Option A: Reload from Strategy 1 save (recommended) ──────────────
+# If Strategy 1 already ran, reload the saved raw counts
+# This saves time and ensures both strategies use identical input data
+
+s1_raw_path <- "~/Desktop/COLORECTAL CANCER/LCP1-NET/all_raw_counts.RData"
+
+if (file.exists(s1_raw_path)) {
+    cat("Loading raw counts from Strategy 1 save...\n")
+    load(s1_raw_path)
+    cat("Loaded: counts_colon, normal_coad_counts, normal_read_counts\n")
+    cat("Loaded: tumour_coad_counts, tumour_read_counts\n")
+    cat("Loaded: meta_colon, meta_coad, meta_read\n")
+    cat("Strategy 1 raw data reused ✓\n")
+
+} else {
+    # ── Option B: Re-download fresh ───────────────────────────────────
+    cat("Strategy 1 save not found — downloading fresh...\n")
+
+    set_recount3_url <- function() {
+        urls <- c(
+            "https://recount-opendata.s3.amazonaws.com/recount3/release",
+            "https://sciserver.org/public-data/recount3/data",
+            "http://duffel.rail.bio/recount3"
+        )
+        for (url in urls) {
+            cat("Trying:", url, "... ")
+            tryCatch({
+                options(recount3_url = url)
+                test <- available_projects()
+                cat("OK ✓\n")
+                return(invisible(test))
+            }, error = function(e) cat("FAILED\n"))
+        }
+        stop("All recount3 URLs failed.")
+    }
+
+    human_projects <- set_recount3_url()
+
+    # GTEx Colon
+    rse_colon    <- create_rse(subset(human_projects,
+        project == "COLON" & file_source == "gtex"))
+    counts_colon <- assay(rse_colon, "raw_counts")
+    meta_colon   <- colData(rse_colon)
+
+    # TCGA-COAD
+    rse_coad    <- create_rse(subset(human_projects,
+        project == "COAD" & file_source == "tcga" &
+        project_type == "data_sources"))
+    counts_coad <- assay(rse_coad, "raw_counts")
+    meta_coad   <- colData(rse_coad)
+
+    tcga_barcodes_coad <- meta_coad$tcga.tcga_barcode
+    sample_type_coad   <- substr(tcga_barcodes_coad, 14, 15)
+    tumour_coad_counts <- counts_coad[, sample_type_coad == "01"]
+    normal_coad_counts <- counts_coad[, sample_type_coad == "11"]
+
+    # TCGA-READ
+    rse_read    <- create_rse(subset(human_projects,
+        project == "READ" & file_source == "tcga" &
+        project_type == "data_sources"))
+    counts_read <- assay(rse_read, "raw_counts")
+    meta_read   <- colData(rse_read)
+
+    tcga_barcodes_read <- meta_read$tcga.tcga_barcode
+    sample_type_read   <- substr(tcga_barcodes_read, 14, 15)
+    tumour_read_counts <- counts_read[, sample_type_read == "01"]
+    normal_read_counts <- counts_read[, sample_type_read == "11"]
+}
+
+n_colon <- ncol(counts_colon)
+n_coad  <- ncol(normal_coad_counts)
+n_read  <- ncol(normal_read_counts)
+
+cat("\nData Acquisition Summary\n")
+cat(rep("-", 42), "\n", sep="")
+cat(sprintf("  %-32s %d\n", "GTEx Colon (normal):",      n_colon))
+cat(sprintf("  %-32s %d\n", "TCGA-COAD matched normal:", n_coad))
+cat(sprintf("  %-32s %d\n", "TCGA-READ matched normal:", n_read))
+cat(sprintf("  %-32s %d\n", "Total normal reference:",
+            n_colon + n_coad + n_read))
+cat("Block 1 complete ✓\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 2 — GENE ID HARMONISATION
+# Strip ENSEMBL version suffixes — identical to Strategy 1
+# ══════════════════════════════════════════════════════════════════════
+
+cat("\nBLOCK 2: Gene ID Harmonisation\n")
+cat(rep("-", 42), "\n", sep="")
+
+strip_version <- function(ids) sub("\\..*", "", ids)
+
+rownames(counts_colon)       <- strip_version(rownames(counts_colon))
+rownames(normal_coad_counts) <- strip_version(rownames(normal_coad_counts))
+rownames(normal_read_counts) <- strip_version(rownames(normal_read_counts))
+rownames(tumour_coad_counts) <- strip_version(rownames(tumour_coad_counts))
+rownames(tumour_read_counts) <- strip_version(rownames(tumour_read_counts))
+
+cat("ENSEMBL version suffixes stripped ✓\n")
+cat("Example:", head(rownames(counts_colon), 2), "\n")
+
+# Find common genes
+common_genes <- Reduce(intersect, list(
+    rownames(counts_colon),
+    rownames(normal_coad_counts),
+    rownames(normal_read_counts),
+    rownames(tumour_coad_counts),
+    rownames(tumour_read_counts)
+))
+cat("Common genes across all sources:", length(common_genes), "\n")
+
+# Subset to common genes
+counts_colon         <- counts_colon[common_genes, ]
+normal_coad_counts   <- normal_coad_counts[common_genes, ]
+normal_read_counts   <- normal_read_counts[common_genes, ]
+tumour_coad_counts   <- tumour_coad_counts[common_genes, ]
+tumour_read_counts   <- tumour_read_counts[common_genes, ]
+
+cat("LCP1 in common genes:", LCP1_ENSEMBL %in% common_genes, "\n")
+cat("Block 2 complete ✓\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 3 — WITHIN-DATASET CPM NORMALISATION BEFORE COMBINING
+# ══════════════════════════════════════════════════════════════════════
+# KEY DIFFERENCE FROM STRATEGY 1:
+#   Strategy 1: combine raw counts → normalise together
+#   Strategy 2: normalise each dataset separately → combine
+#
+# Rationale:
+#   Each dataset has its own library size distribution
+#   shaped by its sequencing protocol and depth.
+#   Normalising to CPM within each source first removes
+#   within-dataset depth differences before cross-dataset
+#   batch effects are addressed. This gives limma a cleaner
+#   signal to correct in the next step.
+#
+# CPM = counts per million
+# log2(CPM+1) = log-transformed CPM with pseudocount
+#   stabilises variance without requiring VST
+#   makes data approximately normally distributed
+#   removes the integer overflow problem entirely
+
+cat("\nBLOCK 3: Within-dataset CPM normalisation\n")
+cat(rep("-", 42), "\n", sep="")
+
+# ── CPM function ──────────────────────────────────────────────────────
+compute_cpm <- function(counts_matrix) {
+    lib_sizes <- colSums(counts_matrix)
+    sweep(counts_matrix, 2, lib_sizes, FUN = "/") * 1e6
+}
+
+# ── Normalise each source independently ───────────────────────────────
+cat("Computing CPM for each source independently...\n")
+
+cpm_colon <- compute_cpm(counts_colon)
+cpm_coad  <- compute_cpm(normal_coad_counts)
+cpm_read  <- compute_cpm(normal_read_counts)
+
+# Verify all columns sum to 1,000,000
+cat("\nColumn sum verification (all should be 1,000,000):\n")
+cat("  GTEx Colon mean:", round(mean(colSums(cpm_colon))), "\n")
+cat("  TCGA COAD mean: ", round(mean(colSums(cpm_coad))),  "\n")
+cat("  TCGA READ mean: ", round(mean(colSums(cpm_read))),  "\n")
+
+# ── Combine CPM-normalised matrices ───────────────────────────────────
+normal_combined_cpm <- cbind(cpm_colon, cpm_coad, cpm_read)
+
+cat("\nCombined CPM matrix:", nrow(normal_combined_cpm),
+    "genes ×", ncol(normal_combined_cpm), "samples\n")
+
+# ── log2(CPM+1) transformation ────────────────────────────────────────
+# Stabilises variance and makes data suitable for limma
+# +1 pseudocount prevents log(0) for zero-count genes
+normal_combined_log2cpm <- log2(normal_combined_cpm + 1)
+
+cat("log2(CPM+1) transformation applied ✓\n")
+cat("Value range: [",
+    round(min(normal_combined_log2cpm), 2), ",",
+    round(max(normal_combined_log2cpm), 2), "]\n")
+# Expected: 0 to approximately 15-18
+
+# ── Batch and tissue labels ───────────────────────────────────────────
+# Identical structure to Strategy 1
+batch_labels <- c(
+    rep("GTEx_Colon",       n_colon),
+    rep("TCGA_COAD_Normal", n_coad),
+    rep("TCGA_READ_Normal", n_read)
+)
+tissue_labels <- c(
+    rep("colon_gtex",            n_colon),
+    rep("colon_matched_normal",  n_coad),
+    rep("rectum_matched_normal", n_read)
+)
+source_labels <- c(
+    rep("GTEx", n_colon),
+    rep("TCGA", n_coad + n_read)
+)
+
+cat("\nBatch distribution:\n")
+print(table(batch_labels))
+
+# ── PCA immediately after CPM — before any batch correction ──────────
+# This shows baseline separation on a fair scale
+cat("\nComputing PCA on log2(CPM+1) combined data...\n")
+pca_cpm <- prcomp(t(normal_combined_log2cpm), scale. = FALSE)
+var_cpm <- pca_cpm$sdev^2 / sum(pca_cpm$sdev^2) * 100
+
+pca_cpm_df <- data.frame(
+    PC1    = pca_cpm$x[, 1],
+    PC2    = pca_cpm$x[, 2],
+    batch  = batch_labels,
+    source = source_labels
+)
+
+p_cpm_raw <- ggplot(pca_cpm_df,
+                    aes(PC1, PC2, colour = batch, shape = source)) +
+    geom_point(size = 3, alpha = 0.8) +
+    labs(
+        title    = "Strategy 2 — PCA: log2(CPM+1) before batch correction",
+        subtitle = paste0("PC1 = ", round(var_cpm[1], 1),
+                          "% — compare this to Strategy 1 before-correction PC1"),
+        x = paste0("PC1 (", round(var_cpm[1], 1), "% variance)"),
+        y = paste0("PC2 (", round(var_cpm[2], 1), "% variance)")
+    ) +
+    theme_minimal(base_size = 12)
+
+print(p_cpm_raw)
+
+cat("\nSave this PC1 value for comparison with Strategy 1\n")
+cat("Strategy 2 pre-correction PC1:", round(var_cpm[1], 1), "%\n")
+cat("Block 3 complete ✓\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 4 — QUALITY CONTROL ON log2CPM MATRIX
+# ══════════════════════════════════════════════════════════════════════
+# Filter on log2CPM values rather than raw counts
+# log2CPM > 1 ≈ CPM > 2 ≈ a gene expressed at meaningful level
+# 30% sample threshold + top 15,000 variance filter
+
+cat("\nBLOCK 4: Quality Control\n")
+cat(rep("-", 42), "\n", sep="")
+
+# ── Expression filter ─────────────────────────────────────────────────
+# Keep genes with log2CPM > 1 in at least 30% of samples
+min_samples_threshold <- ceiling(ncol(normal_combined_log2cpm) * 0.30)
+keep_expressed        <- rowSums(normal_combined_log2cpm > 1) >= min_samples_threshold
+
+cat("Genes before filtering:   ", nrow(normal_combined_log2cpm), "\n")
+cat("30% threshold:            ", min_samples_threshold, "samples\n")
+cat("Genes passing filter:     ", sum(keep_expressed), "\n")
+
+# Check LCP1
+lcp1_expressed <- LCP1_ENSEMBL %in%
+    rownames(normal_combined_log2cpm)[keep_expressed]
+cat("LCP1 at 30% threshold:    ", lcp1_expressed, "\n")
+
+if (!lcp1_expressed) {
+    cat("Lowering to 10% to retain LCP1...\n")
+    min_samples_threshold <- ceiling(ncol(normal_combined_log2cpm) * 0.10)
+    keep_expressed        <- rowSums(normal_combined_log2cpm > 1) >= min_samples_threshold
+    cat("Genes at 10%:", sum(keep_expressed), "\n")
+    cat("LCP1 at 10%:", LCP1_ENSEMBL %in%
+        rownames(normal_combined_log2cpm)[keep_expressed], "\n")
+}
+
+# ── Variance filter ───────────────────────────────────────────────────
+# Top 15,000 most variable genes from those passing expression filter
+expressed_genes <- rownames(normal_combined_log2cpm)[keep_expressed]
+gene_var        <- apply(normal_combined_log2cpm[expressed_genes, ], 1, var)
+top_var_flag    <- rank(-gene_var) <= 15000
+
+# Force LCP1 inclusion regardless of variance rank
+if (LCP1_ENSEMBL %in% names(gene_var)) {
+    top_var_flag[names(gene_var) == LCP1_ENSEMBL] <- TRUE
+    cat("LCP1 forced into final gene set ✓\n")
+}
+
+keep_final_genes      <- expressed_genes[top_var_flag]
+normal_filtered_s2    <- normal_combined_log2cpm[keep_final_genes, ]
+
+cat("\nGenes after variance filter: ", length(keep_final_genes), "\n")
+cat("LCP1 in final set:           ",
+    LCP1_ENSEMBL %in% rownames(normal_filtered_s2), "\n")
+
+# ── Sample quality check ──────────────────────────────────────────────
+# Check on raw counts for the same samples
+raw_combined_check <- cbind(counts_colon, normal_coad_counts, normal_read_counts)
+lib_sizes          <- colSums(raw_combined_check[keep_final_genes, ])
+low_lib_flag       <- lib_sizes < quantile(lib_sizes, 0.05)
+
+if (any(low_lib_flag)) {
+    cat("\nRemoving", sum(low_lib_flag), "low-quality samples\n")
+    normal_filtered_s2 <- normal_filtered_s2[, !low_lib_flag]
+    batch_labels       <- batch_labels[!low_lib_flag]
+    tissue_labels      <- tissue_labels[!low_lib_flag]
+    source_labels      <- source_labels[!low_lib_flag]
+} else {
+    cat("All samples pass library size QC ✓\n")
+}
+
+cat("\nFinal reference matrix (Strategy 2):\n")
+cat("  Genes:       ", nrow(normal_filtered_s2), "\n")
+cat("  Samples:     ", ncol(normal_filtered_s2), "\n")
+cat("  LCP1 present:", LCP1_ENSEMBL %in% rownames(normal_filtered_s2), "\n")
+cat("Block 4 complete ✓\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 6 — BATCH CORRECTION via limma on log2(CPM+1)
+# ══════════════════════════════════════════════════════════════════════
+# Fix A and Block 5 are NOT needed in Strategy 2:
+#   - Fix A: integer overflow cannot occur on log2CPM values
+#   - Block 5: VST is replaced by log2(CPM+1) from Block 3
+#
+# limma::removeBatchEffect applied directly to log2CPM values
+# Output: expr_corrected_s2 — ready for WGCNA
+
+cat("\nBLOCK 6: Batch Correction via limma\n")
+cat(rep("-", 42), "\n", sep="")
+
+# ── PCA before correction ─────────────────────────────────────────────
+pca_before <- prcomp(t(normal_filtered_s2), scale. = FALSE)
+var_before <- pca_before$sdev^2 / sum(pca_before$sdev^2) * 100
+
+pca_before_df <- data.frame(
+    PC1    = pca_before$x[, 1],
+    PC2    = pca_before$x[, 2],
+    batch  = batch_labels,
+    tissue = tissue_labels,
+    source = source_labels
+)
+
+p_before <- ggplot(pca_before_df,
+                   aes(PC1, PC2, colour = batch, shape = source)) +
+    geom_point(size = 3, alpha = 0.8) +
+    labs(
+        title    = "Strategy 2 — PCA before limma correction",
+        subtitle = paste0("PC1 = ", round(var_before[1], 1),
+                          "% (filtered log2CPM)"),
+        x = paste0("PC1 (", round(var_before[1], 1), "% variance)"),
+        y = paste0("PC2 (", round(var_before[2], 1), "% variance)")
+    ) +
+    theme_minimal(base_size = 12)
+
+print(p_before)
+
+# ── Apply limma batch correction ──────────────────────────────────────
+cat("\nApplying limma::removeBatchEffect...\n")
+cat("Batches:", paste(unique(batch_labels), collapse = ", "), "\n")
+
+expr_corrected_s2 <- removeBatchEffect(
+    normal_filtered_s2,
+    batch = batch_labels
+)
+
+cat("limma correction complete ✓\n")
+cat("Dimensions:", nrow(expr_corrected_s2), "genes ×",
+    ncol(expr_corrected_s2), "samples\n")
+cat("Value range: [",
+    round(min(expr_corrected_s2), 2), ",",
+    round(max(expr_corrected_s2), 2), "]\n")
+
+# ── PCA after correction ──────────────────────────────────────────────
+pca_after  <- prcomp(t(expr_corrected_s2), scale. = FALSE)
+var_after  <- pca_after$sdev^2 / sum(pca_after$sdev^2) * 100
+
+pca_after_df <- data.frame(
+    PC1    = pca_after$x[, 1],
+    PC2    = pca_after$x[, 2],
+    batch  = batch_labels,
+    tissue = tissue_labels,
+    source = source_labels
+)
+
+p_after <- ggplot(pca_after_df,
+                  aes(PC1, PC2, colour = batch, shape = source)) +
+    geom_point(size = 3, alpha = 0.8) +
+    labs(
+        title    = "Strategy 2 — PCA after limma correction",
+        subtitle = paste0("PC1 = ", round(var_after[1], 1),
+                          "% — compare to Strategy 1 after-correction PC1"),
+        x = paste0("PC1 (", round(var_after[1], 1), "% variance)"),
+        y = paste0("PC2 (", round(var_after[2], 1), "% variance)")
+    ) +
+    theme_minimal(base_size = 12)
+
+print(p_after)
+
+# ── Save PCA comparison plots ─────────────────────────────────────────
+pdf(file.path(BASE_PATH_S2, "plots/strategy2_batch_correction_PCA.pdf"),
+    width = 16, height = 7)
+grid.arrange(p_before, p_after, ncol = 2)
+dev.off()
+cat("PCA plots saved\n")
+
+# ── Residual batch correlation diagnostic ─────────────────────────────
+batch_numeric  <- as.numeric(factor(batch_labels))
+pc1_r          <- cor(pca_after$x[, 1], batch_numeric)
+pc2_r          <- cor(pca_after$x[, 2], batch_numeric)
+
+cat("\nResidual batch correlation (Strategy 2):\n")
+cat("  PC1 vs batch: ", round(pc1_r, 3), "\n")
+cat("  PC2 vs batch: ", round(pc2_r, 3), "\n")
+cat("  Target |r| < 0.2\n")
+cat("  Strategy 2 PC1 variance after correction:",
+    round(var_after[1], 1), "%\n")
+cat("  Record this for comparison with Strategy 1\n")
+
+cat("Block 6 complete ✓\n")
+```
