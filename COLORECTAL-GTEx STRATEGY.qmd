@@ -63,7 +63,7 @@ cat(rep("=", 60), "\n", sep="")
 ```{r}
 # ══════════════════════════════════════════════════════════════════════
 # BLOCK 1 — DATA ACQUISITION
-# Reload from Strategy 1 save if available
+# Reload from Strategy 1 save if availablE
 # ══════════════════════════════════════════════════════════════════════
 
 cat("\nBLOCK 1: Data Acquisition\n")
