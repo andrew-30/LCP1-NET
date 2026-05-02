@@ -1,0 +1,628 @@
+---
+title: "COLORECTAL-GTEx STRATEGY"
+format: html
+editor: visual
+---
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# LCP1-NET: WGCNA Pipeline — Strategy 3
+# GTEx-only normal reference with covariate regression
+#
+# Key differences from Strategies 1 and 2:
+#   - Normal reference built from GTEx colon ONLY (~700 samples)
+#   - TCGA matched normals removed from training data entirely
+#   - Known biological covariates regressed out within GTEx
+#     before WGCNA (age, sex, RNA integrity)
+#   - TCGA normals held out as validation group
+#   - TCGA tumours scored as test group
+#
+# This produces a three-way anomaly comparison:
+#   GTEx normals (training baseline)
+#   TCGA normals (held-out — captures field cancerisation)
+#   TCGA tumours (test — captures tumour network dysregulation)
+#
+# Scientific rationale:
+#   TCGA matched normals are collected adjacent to active tumours
+#   from cancer patients. Field cancerisation, systemic inflammation,
+#   and tumour microenvironment signals mean these samples are not
+#   truly normal. Including them in the normal reference dilutes
+#   the anomaly signal and biases co-expression module detection.
+#   GTEx colon samples from healthy volunteers represent the
+#   cleanest available normal colorectal tissue reference.
+# ══════════════════════════════════════════════════════════════════════
+
+library(ggplot2)
+library(jsonlite)
+library(limma)
+suppressPackageStartupMessages({
+    library(recount3)
+    library(DESeq2)
+    library(WGCNA)
+    library(flashClust)
+    library(SummarizedExperiment)
+    library(gridExtra)
+})
+
+allowWGCNAThreads()
+
+# ── Paths ─────────────────────────────────────────────────────────────
+BASE_PATH_S3 <- "~/Desktop/COLORECTAL CANCER/LCP1-NET/strategy3"
+
+dir.create(file.path(BASE_PATH_S3, "data/wgcna"),     recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(BASE_PATH_S3, "data/processed"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(BASE_PATH_S3, "ml_outputs"),     recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(BASE_PATH_S3, "plots"),          recursive = TRUE, showWarnings = FALSE)
+
+LCP1_ENSEMBL <- "ENSG00000159111"
+
+cat("Strategy 3 environment ready ✓\n")
+cat(rep("=", 60), "\n", sep="")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 1 — DATA ACQUISITION
+# Reload from Strategy 1 save if available
+# ══════════════════════════════════════════════════════════════════════
+
+cat("\nBLOCK 1: Data Acquisition\n")
+cat(rep("-", 42), "\n", sep="")
+
+s1_raw_path <- "~/Desktop/COLORECTAL CANCER/LCP1-NET/all_raw_counts.RData"
+
+if (file.exists(s1_raw_path)) {
+    cat("Reloading raw counts from Strategy 1 save...\n")
+    load(s1_raw_path)
+    cat("Loaded successfully ✓\n")
+    cat("  counts_colon:       ", ncol(counts_colon),       "samples\n")
+    cat("  normal_coad_counts: ", ncol(normal_coad_counts), "samples\n")
+    cat("  normal_read_counts: ", ncol(normal_read_counts), "samples\n")
+    cat("  tumour_coad_counts: ", ncol(tumour_coad_counts), "samples\n")
+    cat("  tumour_read_counts: ", ncol(tumour_read_counts), "samples\n")
+
+} else {
+    cat("Strategy 1 save not found — downloading...\n")
+
+    set_recount3_url <- function() {
+        urls <- c(
+            "https://recount-opendata.s3.amazonaws.com/recount3/release",
+            "https://sciserver.org/public-data/recount3/data",
+            "http://duffel.rail.bio/recount3"
+        )
+        for (url in urls) {
+            cat("Trying:", url, "... ")
+            tryCatch({
+                options(recount3_url = url)
+                test <- available_projects()
+                cat("OK ✓\n")
+                return(invisible(test))
+            }, error = function(e) cat("FAILED\n"))
+        }
+        stop("All recount3 URLs failed.")
+    }
+
+    human_projects <- set_recount3_url()
+
+    # GTEx Colon
+    rse_colon    <- create_rse(subset(human_projects,
+        project == "COLON" & file_source == "gtex"))
+    counts_colon <- assay(rse_colon, "raw_counts")
+    meta_colon   <- colData(rse_colon)
+
+    # TCGA-COAD
+    rse_coad  <- create_rse(subset(human_projects,
+        project == "COAD" & file_source == "tcga" &
+        project_type == "data_sources"))
+    counts_coad <- assay(rse_coad, "raw_counts")
+    meta_coad   <- colData(rse_coad)
+
+    barcodes_coad      <- meta_coad$tcga.tcga_barcode
+    type_coad          <- substr(barcodes_coad, 14, 15)
+    tumour_coad_counts <- counts_coad[, type_coad == "01"]
+    normal_coad_counts <- counts_coad[, type_coad == "11"]
+
+    # TCGA-READ
+    rse_read  <- create_rse(subset(human_projects,
+        project == "READ" & file_source == "tcga" &
+        project_type == "data_sources"))
+    counts_read <- assay(rse_read, "raw_counts")
+    meta_read   <- colData(rse_read)
+
+    barcodes_read      <- meta_read$tcga.tcga_barcode
+    type_read          <- substr(barcodes_read, 14, 15)
+    tumour_read_counts <- counts_read[, type_read == "01"]
+    normal_read_counts <- counts_read[, type_read == "11"]
+
+    save(counts_colon,
+         normal_coad_counts, normal_read_counts,
+         tumour_coad_counts, tumour_read_counts,
+         meta_colon, meta_coad, meta_read,
+         file = s1_raw_path)
+    cat("Raw data saved ✓\n")
+}
+
+n_gtex <- ncol(counts_colon)
+cat("\nBlock 1 complete ✓\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 2 — GENE ID HARMONISATION
+# ══════════════════════════════════════════════════════════════════════
+
+cat("\nBLOCK 2: Gene ID Harmonisation\n")
+cat(rep("-", 42), "\n", sep="")
+
+strip_version <- function(ids) sub("\\..*", "", ids)
+
+rownames(counts_colon)       <- strip_version(rownames(counts_colon))
+rownames(normal_coad_counts) <- strip_version(rownames(normal_coad_counts))
+rownames(normal_read_counts) <- strip_version(rownames(normal_read_counts))
+rownames(tumour_coad_counts) <- strip_version(rownames(tumour_coad_counts))
+rownames(tumour_read_counts) <- strip_version(rownames(tumour_read_counts))
+
+# Find common genes across all five matrices
+# Even though TCGA normals are not used for training,
+# we still need common genes for tumour projection later
+common_genes <- Reduce(intersect, list(
+    rownames(counts_colon),
+    rownames(normal_coad_counts),
+    rownames(normal_read_counts),
+    rownames(tumour_coad_counts),
+    rownames(tumour_read_counts)
+))
+cat("Common genes across all sources:", length(common_genes), "\n")
+
+counts_colon         <- counts_colon[common_genes, ]
+normal_coad_counts   <- normal_coad_counts[common_genes, ]
+normal_read_counts   <- normal_read_counts[common_genes, ]
+tumour_coad_counts   <- tumour_coad_counts[common_genes, ]
+tumour_read_counts   <- tumour_read_counts[common_genes, ]
+
+cat("LCP1 in common genes:", LCP1_ENSEMBL %in% common_genes, "\n")
+cat("Block 2 complete ✓\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 3 — GTEx-ONLY NORMAL REFERENCE
+# ══════════════════════════════════════════════════════════════════════
+# Strategy 3 uses GTEx colon ONLY as the normal reference.
+# TCGA matched normals are deliberately excluded from training.
+#
+# They are preserved separately for:
+#   1. Held-out validation (three-way anomaly comparison)
+#   2. Demonstrating field cancerisation effect in Results
+
+cat("\nBLOCK 3: GTEx-Only Normal Reference\n")
+cat(rep("-", 42), "\n", sep="")
+
+# Normal reference = GTEx colon only
+normal_gtex <- counts_colon
+
+cat("Normal reference (GTEx only):", ncol(normal_gtex), "samples\n")
+cat("Genes:", nrow(normal_gtex), "\n")
+
+# Store TCGA normals separately for later validation
+tcga_normal_combined <- cbind(normal_coad_counts, normal_read_counts)
+tcga_normal_labels   <- c(
+    rep("TCGA_COAD_Normal", ncol(normal_coad_counts)),
+    rep("TCGA_READ_Normal", ncol(normal_read_counts))
+)
+
+cat("\nTCGA normals held out for validation:\n")
+cat("  TCGA-COAD normal:", ncol(normal_coad_counts), "samples\n")
+cat("  TCGA-READ normal:", ncol(normal_read_counts), "samples\n")
+cat("  Total held-out:  ", ncol(tcga_normal_combined), "samples\n")
+cat("\nThree-way comparison will be:\n")
+cat("  Group 1: GTEx normals (training baseline)\n")
+cat("  Group 2: TCGA normals (held-out validation)\n")
+cat("  Group 3: TCGA tumours (test anomaly group)\n")
+cat("Block 3 complete ✓\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 4 — QUALITY CONTROL
+# Applied to GTEx samples only
+# ══════════════════════════════════════════════════════════════════════
+
+cat("\nBLOCK 4: Quality Control (GTEx only)\n")
+cat(rep("-", 42), "\n", sep="")
+
+# ── Expression filter ─────────────────────────────────────────────────
+# 20% threshold on GTEx samples only
+# ~700 GTEx samples → threshold ~140 samples
+min_samples_threshold <- ceiling(ncol(normal_gtex) * 0.20)
+keep_expressed        <- rowSums(normal_gtex > 10) >= min_samples_threshold
+
+cat("Genes before filtering:", nrow(normal_gtex), "\n")
+cat("20% threshold (GTEx):  ", min_samples_threshold, "samples\n")
+cat("Genes passing filter:  ", sum(keep_expressed), "\n")
+
+# Check LCP1
+lcp1_pass <- LCP1_ENSEMBL %in% rownames(normal_gtex)[keep_expressed]
+cat("LCP1 at 20% threshold: ", lcp1_pass, "\n")
+
+if (!lcp1_pass) {
+    cat("Lowering to 10%...\n")
+    min_samples_threshold <- ceiling(ncol(normal_gtex) * 0.10)
+    keep_expressed        <- rowSums(normal_gtex > 10) >= min_samples_threshold
+    cat("Genes at 10%:", sum(keep_expressed), "\n")
+    cat("LCP1 at 10%: ", LCP1_ENSEMBL %in%
+        rownames(normal_gtex)[keep_expressed], "\n")
+}
+
+# ── Variance filter ───────────────────────────────────────────────────
+# Top 15,000 most variable genes within GTEx
+expressed_gtex <- rownames(normal_gtex)[keep_expressed]
+gene_var_gtex  <- apply(normal_gtex[expressed_gtex, ], 1, var)
+top_var_flag   <- rank(-gene_var_gtex) <= 15000
+
+# Force LCP1 inclusion
+if (LCP1_ENSEMBL %in% names(gene_var_gtex)) {
+    top_var_flag[names(gene_var_gtex) == LCP1_ENSEMBL] <- TRUE
+    cat("LCP1 forced into gene set ✓\n")
+}
+
+keep_final_genes <- expressed_gtex[top_var_flag]
+normal_gtex_filtered <- normal_gtex[keep_final_genes, ]
+
+cat("\nGenes after variance filter:", length(keep_final_genes), "\n")
+cat("LCP1 in final set:          ",
+    LCP1_ENSEMBL %in% rownames(normal_gtex_filtered), "\n")
+
+# ── Library size QC ───────────────────────────────────────────────────
+lib_sizes         <- colSums(normal_gtex_filtered)
+low_lib_flag      <- lib_sizes < quantile(lib_sizes, 0.05)
+
+cat("\nGTEx library size summary:\n")
+print(summary(lib_sizes))
+
+if (any(low_lib_flag)) {
+    cat("Removing", sum(low_lib_flag), "low-quality GTEx samples\n")
+    normal_gtex_filtered <- normal_gtex_filtered[, !low_lib_flag]
+    cat("GTEx samples remaining:", ncol(normal_gtex_filtered), "\n")
+} else {
+    cat("All GTEx samples pass library size QC ✓\n")
+}
+
+cat("\nFinal GTEx reference:\n")
+cat("  Samples:", ncol(normal_gtex_filtered), "\n")
+cat("  Genes:  ", nrow(normal_gtex_filtered), "\n")
+cat("  LCP1 present:",
+    LCP1_ENSEMBL %in% rownames(normal_gtex_filtered), "\n")
+cat("Block 4 complete ✓\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# FIX A — CLEAN GTEx COUNTS BEFORE VST
+# ══════════════════════════════════════════════════════════════════════
+
+cat("\nFix A: Cleaning GTEx counts...\n")
+cat(rep("-", 42), "\n", sep="")
+
+n_na    <- sum(is.na(normal_gtex_filtered))
+n_large <- sum(normal_gtex_filtered > .Machine$integer.max, na.rm = TRUE)
+n_neg   <- sum(normal_gtex_filtered < 0, na.rm = TRUE)
+
+cat("NA values:            ", n_na,    "\n")
+cat("Values > integer max: ", n_large, "\n")
+cat("Negative values:      ", n_neg,   "\n")
+
+normal_gtex_clean <- normal_gtex_filtered
+
+normal_gtex_clean[
+    normal_gtex_clean > .Machine$integer.max] <- .Machine$integer.max
+normal_gtex_clean[!is.finite(normal_gtex_clean)] <- 0
+normal_gtex_clean[is.na(normal_gtex_clean)]      <- 0
+normal_gtex_clean[normal_gtex_clean < 0]         <- 0
+normal_gtex_clean <- round(normal_gtex_clean)
+storage.mode(normal_gtex_clean) <- "integer"
+
+cat("After cleaning:\n")
+cat("  NA values:    ", sum(is.na(normal_gtex_clean)),    "\n")
+cat("  Negatives:    ", sum(normal_gtex_clean < 0),       "\n")
+cat("  Storage mode: ", storage.mode(normal_gtex_clean),  "\n")
+cat("Fix A complete ✓\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 5 — VST NORMALISATION (GTEx only)
+# ══════════════════════════════════════════════════════════════════════
+# No batch correction needed here — all samples are from GTEx
+# processed through the same Monorail pipeline.
+# We regress out biological covariates (age, sex, RIN) instead.
+
+cat("\nBLOCK 5: VST Normalisation\n")
+cat(rep("-", 42), "\n", sep="")
+
+# No batch labels needed — single source
+col_data_gtex <- data.frame(
+    sample_id = colnames(normal_gtex_clean),
+    row.names = colnames(normal_gtex_clean)
+)
+
+dds_gtex <- DESeqDataSetFromMatrix(
+    countData = normal_gtex_clean,
+    colData   = col_data_gtex,
+    design    = ~1
+)
+
+cat("Applying VST to GTEx-only matrix...\n")
+vst_gtex    <- vst(dds_gtex, blind = TRUE)
+expr_gtex   <- assay(vst_gtex)
+
+cat("VST complete ✓\n")
+cat("Dimensions:", nrow(expr_gtex), "genes ×",
+    ncol(expr_gtex), "samples\n")
+cat("Value range: [",
+    round(min(expr_gtex), 2), ",",
+    round(max(expr_gtex), 2), "]\n")
+cat("Block 5 complete ✓\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 6 — COVARIATE REGRESSION WITHIN GTEx
+# ══════════════════════════════════════════════════════════════════════
+# Since all samples are from GTEx, we have no inter-batch effects
+# to correct. Instead we regress out known biological and technical
+# covariates that drive within-GTEx variance:
+#
+#   RNA integrity score (SMRIN) — technical quality variable
+#   Donor age                  — biological covariate
+#   Donor sex                  — biological covariate
+#
+# This reduces the within-GTEx PC1 variance and produces cleaner
+# co-expression modules that reflect shared tissue biology
+# rather than donor-to-donor demographic differences.
+#
+# Only the covariate effect is removed — the underlying
+# gene expression variance used for WGCNA is preserved.
+
+cat("\nBLOCK 6: Covariate Regression Within GTEx\n")
+cat(rep("-", 42), "\n", sep="")
+
+# ── Inspect available GTEx metadata columns ───────────────────────────
+cat("Available GTEx metadata columns (subset):\n")
+meta_cols <- colnames(meta_colon)
+print(head(meta_cols, 40))
+
+# Common GTEx metadata column names in recount3:
+# gtex.smrin   — RNA integrity number (RIN)
+# gtex.sex     — donor sex (1 = male, 2 = female)
+# gtex.age     — donor age range (e.g. "50-59")
+# gtex.smtsd   — tissue subsite (e.g. "Colon - Sigmoid")
+# gtex.smcenter— collection center
+
+# Filter metadata to samples that survived QC
+# (normal_gtex_clean column names are the surviving samples)
+gtex_meta_filtered <- as.data.frame(meta_colon)[
+    colnames(normal_gtex_clean), ]
+
+cat("\nSample counts in filtered metadata:",
+    nrow(gtex_meta_filtered), "\n")
+
+# ── PCA before covariate regression ──────────────────────────────────
+pca_before_cov <- prcomp(t(expr_gtex), scale. = FALSE)
+var_before_cov <- pca_before_cov$sdev^2 /
+                  sum(pca_before_cov$sdev^2) * 100
+
+# Colour by available metadata for diagnosis
+if ("gtex.sex" %in% meta_cols) {
+    sex_labels <- as.factor(gtex_meta_filtered$gtex.sex)
+} else {
+    sex_labels <- rep("unknown", ncol(expr_gtex))
+}
+
+pca_before_df <- data.frame(
+    PC1 = pca_before_cov$x[, 1],
+    PC2 = pca_before_cov$x[, 2],
+    sex = sex_labels
+)
+
+p_before_cov <- ggplot(pca_before_df,
+                       aes(PC1, PC2, colour = sex)) +
+    geom_point(size = 2.5, alpha = 0.7) +
+    labs(
+        title    = "Strategy 3 — GTEx PCA before covariate regression",
+        subtitle = paste0("PC1 = ", round(var_before_cov[1], 1),
+                          "% — coloured by donor sex"),
+        x = paste0("PC1 (", round(var_before_cov[1], 1), "%)"),
+        y = paste0("PC2 (", round(var_before_cov[2], 1), "%)")
+    ) +
+    theme_minimal(base_size = 12)
+
+print(p_before_cov)
+cat("PC1 variance before covariate regression:",
+    round(var_before_cov[1], 1), "%\n")
+
+# ── Build covariate matrix ────────────────────────────────────────────
+# Only include covariates that actually exist in your metadata
+# Check each before using
+
+covariates_available <- c()
+covariate_matrix     <- NULL
+
+# RNA integrity score
+if ("gtex.smrin" %in% meta_cols) {
+    rin_vals <- as.numeric(gtex_meta_filtered$gtex.smrin)
+    if (sum(!is.na(rin_vals)) > ncol(expr_gtex) * 0.8) {
+        rin_vals[is.na(rin_vals)] <- median(rin_vals, na.rm = TRUE)
+        covariate_matrix <- cbind(covariate_matrix, RIN = rin_vals)
+        covariates_available <- c(covariates_available, "RNA integrity (RIN)")
+        cat("Added covariate: RNA integrity (RIN)\n")
+    }
+}
+
+# Donor sex
+if ("gtex.sex" %in% meta_cols) {
+    sex_vals <- as.numeric(gtex_meta_filtered$gtex.sex)
+    if (sum(!is.na(sex_vals)) > ncol(expr_gtex) * 0.8) {
+        sex_vals[is.na(sex_vals)] <- 1
+        covariate_matrix <- cbind(covariate_matrix, sex = sex_vals)
+        covariates_available <- c(covariates_available, "donor sex")
+        cat("Added covariate: donor sex\n")
+    }
+}
+
+# Donor age — GTEx stores as range (e.g. "50-59")
+# Convert to numeric midpoint
+if ("gtex.age" %in% meta_cols) {
+    age_raw  <- gtex_meta_filtered$gtex.age
+    age_mid  <- sapply(strsplit(as.character(age_raw), "-"),
+                       function(x) mean(as.numeric(x)))
+    if (sum(!is.na(age_mid)) > ncol(expr_gtex) * 0.8) {
+        age_mid[is.na(age_mid)] <- median(age_mid, na.rm = TRUE)
+        covariate_matrix <- cbind(covariate_matrix, age = age_mid)
+        covariates_available <- c(covariates_available, "donor age")
+        cat("Added covariate: donor age\n")
+    }
+}
+
+# Tissue collection site (center)
+if ("gtex.smcenter" %in% meta_cols) {
+    center_vals <- as.numeric(factor(gtex_meta_filtered$gtex.smcenter))
+    covariate_matrix <- cbind(covariate_matrix, center = center_vals)
+    covariates_available <- c(covariates_available, "collection center")
+    cat("Added covariate: collection center\n")
+}
+
+if (is.null(covariate_matrix) || length(covariates_available) == 0) {
+    cat("\nWARNING: No covariates found in metadata\n")
+    cat("Check column names above and update accordingly\n")
+    cat("Proceeding without covariate regression\n")
+    cat("expr_corrected_s3 = expr_gtex (no regression applied)\n")
+    expr_corrected_s3 <- expr_gtex
+
+} else {
+    cat("\nCovariates being regressed out:\n")
+    for (cov in covariates_available) cat(" -", cov, "\n")
+
+    # ── Apply covariate regression via limma ──────────────────────────
+    # removeBatchEffect with covariates argument removes the linear
+    # effect of each covariate while preserving expression variance
+    cat("\nApplying limma covariate regression...\n")
+
+    expr_corrected_s3 <- removeBatchEffect(
+        expr_gtex,
+        covariates = covariate_matrix
+    )
+
+    cat("Covariate regression complete ✓\n")
+    cat("Value range after regression: [",
+        round(min(expr_corrected_s3), 2), ",",
+        round(max(expr_corrected_s3), 2), "]\n")
+}
+
+# ── PCA after covariate regression ───────────────────────────────────
+pca_after_cov <- prcomp(t(expr_corrected_s3), scale. = FALSE)
+var_after_cov <- pca_after_cov$sdev^2 /
+                 sum(pca_after_cov$sdev^2) * 100
+
+pca_after_df <- data.frame(
+    PC1 = pca_after_cov$x[, 1],
+    PC2 = pca_after_cov$x[, 2],
+    sex = sex_labels
+)
+
+p_after_cov <- ggplot(pca_after_df,
+                      aes(PC1, PC2, colour = sex)) +
+    geom_point(size = 2.5, alpha = 0.7) +
+    labs(
+        title    = "Strategy 3 — GTEx PCA after covariate regression",
+        subtitle = paste0("PC1 = ", round(var_after_cov[1], 1),
+                          "% — sex effect should be reduced"),
+        x = paste0("PC1 (", round(var_after_cov[1], 1), "%)"),
+        y = paste0("PC2 (", round(var_after_cov[2], 1), "%)")
+    ) +
+    theme_minimal(base_size = 12)
+
+print(p_after_cov)
+
+# Save covariate regression PCA
+pdf(file.path(BASE_PATH_S3, "plots/covariate_regression_PCA.pdf"),
+    width = 16, height = 7)
+grid.arrange(p_before_cov, p_after_cov, ncol = 2)
+dev.off()
+cat("PCA plots saved\n")
+
+cat("\nPC1 variance summary:\n")
+cat("  Before covariate regression:", round(var_before_cov[1], 1), "%\n")
+cat("  After covariate regression: ", round(var_after_cov[1], 1), "%\n")
+cat("  Reduction:                  ",
+    round(var_before_cov[1] - var_after_cov[1], 1), "%\n")
+
+cat("Block 6 complete ✓\n")
+cat("expr_corrected_s3 is ready for WGCNA\n")
+```
+
+```{r}
+# ── Environment diagnostic ────────────────────────────────────────────
+# Run this to see exactly what variables exist in your session
+
+cat("All objects currently in your R environment:\n")
+print(ls())
+
+cat("\nLooking for expression-related objects:\n")
+expr_objects <- ls()[grep("expr|corrected|gtex|vst|normal",
+                           ls(), ignore.case = TRUE)]
+print(expr_objects)
+
+cat("\nLooking for PCA objects:\n")
+pca_objects <- ls()[grep("pca", ls(), ignore.case = TRUE)]
+print(pca_objects)
+```
+
+```{r}
+# ── Check 1: Sample outlier detection ────────────────────────────────
+# pca_after_cov already exists from Block 6 — no changes needed here
+
+pca_scores   <- pca_after_cov$x[, 1:2]
+
+pc1_outliers <- abs(scale(pca_scores[, 1])) > 3
+pc2_outliers <- abs(scale(pca_scores[, 2])) > 3
+outlier_flag <- pc1_outliers | pc2_outliers
+
+cat("Samples flagged as potential outliers:\n")
+cat("  PC1 outliers:", sum(pc1_outliers), "\n")
+cat("  PC2 outliers:", sum(pc2_outliers), "\n")
+cat("  Total unique:", sum(outlier_flag), "\n")
+
+if (any(outlier_flag)) {
+    cat("\nOutlier sample IDs:\n")
+    print(rownames(pca_scores)[outlier_flag])
+    cat("These will be caught and removed by cutreeStatic in Block 7\n")
+} else {
+    cat("No extreme outliers detected ✓\n")
+}
+```
+
+```{r}
+# ── Check 2: Scale-free topology pre-check ────────────────────────────
+cat("expr_corrected_s3 dimensions:", dim(expr_corrected_s3), "\n")
+
+# Transpose for WGCNA format (rows = samples, columns = genes)
+expression.data.s3 <- t(expr_corrected_s3)
+cat("Expression matrix (samples x genes):", dim(expression.data.s3), "\n")
+
+# Scale-free topology check at power = 6
+cat("\nRunning scale-free connectivity check...\n")
+k <- softConnectivity(
+    datExpr = expression.data.s3,
+    power   = 6,
+    type    = "signed"
+)
+
+par(mfrow = c(1, 1))
+scaleFreePlot(k,
+    main = "Scale-free topology check (power = 6)\nStraight line = data suitable for WGCNA")
+
+cat("Check complete\n")
+cat("Straight line on log-log scale = proceed to Block 7 ✓\n")
+cat("Strong curve = flag for supervisor before proceeding\n")
+```
